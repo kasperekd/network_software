@@ -1,0 +1,69 @@
+services:
+    dhcp_server:
+        build:
+            context: .
+            dockerfile: server/Dockerfile
+        container_name: dhcp_server_isolated
+        privileged: true
+        cap_add:
+            - NET_ADMIN
+        networks:
+            dhcp_internal_net: {}
+        depends_on:
+            - netshooter
+        restart: on-failure
+
+    dhcp_client_1:
+        build:
+            context: .
+            dockerfile: client/Dockerfile
+        container_name: dhcp_client_isolated_1
+        privileged: true
+        cap_add:
+            - NET_ADMIN
+        networks:
+            dhcp_internal_net: {}
+        depends_on:
+            - dhcp_server
+            - netshooter
+        restart: on-failure
+        command: /bin/bash -c "sleep 2 && ./dhcp_client configs/client1.conf"
+
+    dhcp_client_2:
+        build:
+            context: .
+            dockerfile: client/Dockerfile
+        container_name: dhcp_client_isolated_2
+        privileged: true
+        cap_add:
+            - NET_ADMIN
+        networks:
+            dhcp_internal_net: {}
+        depends_on:
+            - dhcp_server
+            - netshooter
+        restart: on-failure
+        command: /bin/bash -c "sleep 3 && ./dhcp_client configs/client2.conf"
+
+    netshooter:
+        image: nicolaka/netshoot
+        container_name: netshoot_monitor
+        privileged: true
+        cap_add:
+            - NET_ADMIN
+            - NET_RAW
+        networks:
+            dhcp_internal_net: {}
+        volumes:
+            - ./captures:/captures
+        command: >
+            sh -c "mkdir -p /captures && 
+                   echo 'Starting tcpdump' && 
+                   tcpdump -i eth0 -w /captures/dhcp_traffic.pcap '' & 
+                   PID_TCPDUMP=$$! && 
+                   echo 'tcpdump started with PID ' $$PID_TCPDUMP &&
+                   tail -f /dev/null"
+
+networks:
+    dhcp_internal_net:
+        driver: bridge
