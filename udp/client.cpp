@@ -60,85 +60,149 @@ class UDPClient {
         const size_t maxDataSize = 1400 - sizeof(PacketHeader);
         size_t totalPackets = (fileSize + maxDataSize - 1) / maxDataSize;
 
-        std::vector<std::vector<char>> packets(totalPackets);
+        std::vector<std::vector<char>> packetsData(totalPackets);
         std::vector<bool> ackReceived(totalPackets, false);
-        size_t remaining = totalPackets;
+        std::atomic<size_t> remainingPackets{totalPackets};
+        std::atomic<bool> transferDone{false};
 
         for (size_t i = 0; i < totalPackets; ++i) {
-            packets[i].resize(
-                std::min(maxDataSize, fileSize - i * maxDataSize));
-            file.read(packets[i].data(), packets[i].size());
+            packetsData[i].resize(
+                std::min(maxDataSize, fileSize - (i * maxDataSize)));
+            file.read(packetsData[i].data(), packetsData[i].size());
         }
+        file.close();
 
         const int BAR_WIDTH = 40;
         auto startTime = std::chrono::steady_clock::now();
-        size_t totalSent = 0;
-        std::mutex mtx;
 
         std::cerr << "Sending file '" << filePath << "' to "
                   << inet_ntoa(serverAddr.sin_addr) << ":"
                   << ntohs(serverAddr.sin_port) << "\n";
 
         std::thread progressThread([&]() {
-            while (remaining > 0) {
-                std::lock_guard<std::mutex> lock(mtx);
+            size_t lastRemaining = totalPackets + 1;
+            double lastSpeedMBps = 0.0;
+            size_t lastSentKB = 0;
+            int lastProgress = -1;
+
+            while (true) {
+                size_t currentRemaining = remainingPackets.load();
+                bool done = transferDone.load();
+
+                size_t packetsConfirmed = totalPackets - currentRemaining;
+                size_t currentSentBytes = 0;
+                if (totalPackets > 0) {
+                    (packetsConfirmed * fileSize) / totalPackets;
+                    if (currentRemaining == 0) {
+                        currentSentBytes = fileSize;
+                    }
+                }
+
                 double durationSec =
                     std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - startTime)
                         .count();
 
-                size_t currentSent = (totalPackets - remaining) * maxDataSize;
-                double speedMBps =
-                    (currentSent / 1024.0 / 1024.0) / durationSec;
+                double speedMBps = 0;
+                if (durationSec > 0.01) {
+                    speedMBps =
+                        (currentSentBytes / 1024.0 / 1024.0) / durationSec;
+                } else {
+                    speedMBps = lastSpeedMBps;
+                }
+                lastSpeedMBps = speedMBps;
 
-                int progress = static_cast<int>((currentSent * 100) / fileSize);
-                int filledLength = BAR_WIDTH * progress / 100;
-                std::string bar(filledLength, '#');
-                bar.resize(BAR_WIDTH, ' ');
+                int progress = 0;
+                if (fileSize > 0) {
+                    progress = static_cast<int>(
+                        (static_cast<double>(currentSentBytes) * 100.0) /
+                        fileSize);
+                } else if (totalPackets == 0) {
+                    progress = 100;
+                }
+                progress = std::min(100, std::max(0, progress));
 
-                std::cerr << "\r[" << GREEN << bar << RESET << "] "
-                          << std::setw(3) << progress << "% | "
-                          << "Total: " << (currentSent / 1024) << " KB | "
-                          << "Speed: " << CYAN << speedMBps << RESET
-                          << " MB/s     ";
-                std::cerr.flush();
+                size_t currentSentKB = currentSentBytes / 1024;
 
+                if (progress != lastProgress || currentSentKB != lastSentKB ||
+                    (done && currentRemaining == 0)) {
+                    int filledLength = BAR_WIDTH * progress / 100;
+                    std::string bar(filledLength, '#');
+                    bar.resize(BAR_WIDTH, ' ');
+
+                    std::cerr << "\r[" << GREEN << bar << RESET << "] "
+                              << std::setw(3) << progress << "% | "
+                              << "Total: " << std::setw(7) << currentSentKB
+                              << " KB | "
+                              << "Speed: " << CYAN << std::fixed
+                              << std::setprecision(2) << std::setw(7)
+                              << speedMBps << RESET << " MB/s     "
+                              << std::flush;
+                    lastProgress = progress;
+                    lastSentKB = currentSentKB;
+                }
+
+                if (done && currentRemaining == 0) break;
+
+                if (done && currentRemaining != 0 &&
+                    lastRemaining == currentRemaining) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    if (transferDone.load() &&
+                        remainingPackets.load() == lastRemaining)
+                        break;
+                }
+                lastRemaining = currentRemaining;
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
 
-            {
-                std::lock_guard<std::mutex> lock(mtx);
-                size_t currentSent = fileSize;
-                double durationSec =
-                    std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - startTime)
-                        .count();
-                double speedMBps =
-                    (currentSent / 1024.0 / 1024.0) / durationSec;
-
-                int progress = 100;
-                std::string bar(BAR_WIDTH, '#');
-
-                std::cerr << "\r[" << GREEN << bar << RESET << "] "
-                          << std::setw(3) << progress << "% | "
-                          << "Total: " << (currentSent / 1024) << " KB | "
-                          << "Speed: " << CYAN << speedMBps << RESET
-                          << " MB/s     ";
-                std::cerr.flush();
+            double finalDurationSec =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                              startTime)
+                    .count();
+            double finalSpeedMBps = 0;
+            if (finalDurationSec > 0) {
+                finalSpeedMBps =
+                    (fileSize / 1024.0 / 1024.0) / finalDurationSec;
             }
 
-            std::cerr << "\nFile sent successfully." << std::endl;
-        });
+            std::string finalBar(BAR_WIDTH, '#');
+            std::cerr << "\r[" << GREEN << finalBar << RESET << "] "
+                      << std::setw(3) << 100 << "% | "
+                      << "Total: " << std::setw(7) << (fileSize / 1024)
+                      << " KB | "
+                      << "Speed: " << CYAN << std::fixed << std::setprecision(2)
+                      << std::setw(7) << finalSpeedMBps << RESET << " MB/s     "
+                      << std::flush;
 
-        progressThread.detach();
+            if (remainingPackets.load() == 0) {
+                std::cerr << "\nFile sent successfully." << std::endl;
+            } else {
+                std::cerr << "\nFile transfer incomplete. "
+                          << remainingPackets.load() << " packets not ACKed."
+                          << std::endl;
+            }
+        });
 
         std::mutex ackMutex;
         std::condition_variable cv;
+
         std::thread ackThread([&]() {
             char ackBuffer[sizeof(uint32_t)];
             sockaddr_in fromAddr{};
             socklen_t fromAddrLen = sizeof(fromAddr);
-            while (remaining > 0) {
+
+            struct timeval tv;
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+            if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv,
+                           sizeof tv) < 0) {
+                perror("setsockopt SO_RCVTIMEO failed for ACK");
+                transferDone.store(true);
+                cv.notify_all();
+                return;
+            }
+
+            while (remainingPackets.load() > 0 && !transferDone.load()) {
                 ssize_t recvLen = recvfrom(
                     sockfd, ackBuffer, sizeof(ackBuffer), 0,
                     reinterpret_cast<sockaddr*>(&fromAddr), &fromAddrLen);
@@ -149,57 +213,120 @@ class UDPClient {
                         std::lock_guard<std::mutex> lock(ackMutex);
                         if (!ackReceived[ackNumber]) {
                             ackReceived[ackNumber] = true;
-                            --remaining;
+                            if (remainingPackets.load() > 0) remainingPackets--;
+                            cv.notify_one();
                         }
+                    }
+                } else if (recvLen < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        continue;
+                    }
+                    perror("recvfrom error in ackThread");
+                    transferDone.store(true);
+                    cv.notify_all();
+                    break;
+                }
+            }
+            if (remainingPackets.load() == 0 && !transferDone.load()) {
+                transferDone.store(true);
+                cv.notify_all();
+            }
+        });
+
+        int noAckRetryCount = 0;
+        const int MAX_NO_ACK_RETRIES = 20;
+        const int RETRANSMIT_BATCH_SIZE = (totalPackets / 20) + 1;
+
+        while (remainingPackets.load() > 0 && !transferDone.load()) {
+            size_t remainingBeforeSendCycle = remainingPackets.load();
+            bool packetSentThisCycle = false;
+            int sentInBatch = 0;
+
+            for (size_t i = 0; i < totalPackets; ++i) {
+                if (transferDone.load()) break;
+                bool needsAck;
+                {
+                    std::lock_guard<std::mutex> lock(ackMutex);
+                    needsAck = !ackReceived[i];
+                }
+                if (needsAck) {
+                    sendPacket(i, totalPackets, packetsData[i]);
+                    packetSentThisCycle = true;
+                    sentInBatch++;
+                    if (delayMs > 0) {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(delayMs));
+                    }
+
+                    if (sentInBatch >= RETRANSMIT_BATCH_SIZE && delayMs == 0) {
+                        std::unique_lock<std::mutex> lock(ackMutex);
+                        cv.wait_for(lock, std::chrono::milliseconds(10));
+                        sentInBatch = 0;
                     }
                 }
             }
-            cv.notify_all();
-        });
 
-        ackThread.detach();
+            if (transferDone.load() || remainingPackets.load() == 0) break;
 
-        while (remaining > 0) {
-            for (size_t i = 0; i < totalPackets; ++i) {
-                if (!ackReceived[i]) {
-                    sendPacket(i, totalPackets, packets[i]);
-                    // FIXME Я не проверял, но может вообще стоит вынести в
-                    // условие, чтоб если у нас нулевая задержка, мы не заходили
-                    // в функцию вообще
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(delayMs));
+            if (packetSentThisCycle) {
+                std::unique_lock<std::mutex> lock(ackMutex);
+                if (cv.wait_for(lock,
+                                std::chrono::milliseconds(500 + delayMs * 5)) ==
+                    std::cv_status::timeout) {
+                    if (remainingPackets.load() == remainingBeforeSendCycle) {
+                        noAckRetryCount++;
+                    } else {
+                        noAckRetryCount = 0;
+                    }
+                } else {
+                    noAckRetryCount = 0;
                 }
+            } else {
+                std::unique_lock<std::mutex> lock(ackMutex);
+                cv.wait_for(lock, std::chrono::milliseconds(200));
+                if (remainingPackets.load() == 0) break;
+            }
+
+            if (noAckRetryCount > MAX_NO_ACK_RETRIES) {
+                std::cerr << "\nNo ACKs received for " << noAckRetryCount
+                          << " cycles. Aborting transfer." << std::endl;
+                transferDone.store(true);
+                cv.notify_all();
+                break;
             }
         }
 
-        {
-            std::unique_lock<std::mutex> lock(ackMutex);
-            cv.wait_for(lock, std::chrono::seconds(1));  // Ждём завершения
-        }
+        transferDone.store(true);
+        cv.notify_all();
 
-        if (ackThread.joinable()) ackThread.join();
-        if (progressThread.joinable()) progressThread.join();
+        if (ackThread.joinable()) {
+            ackThread.join();
+        }
+        if (progressThread.joinable()) {
+            progressThread.join();
+        }
     }
 
    private:
     int sockfd;
     sockaddr_in serverAddr;
 
-    void sendPacket(size_t packetNumber, size_t totalPackets,
+    void sendPacket(size_t packetNumber, size_t totalPacketsCount,
                     const std::vector<char>& data) {
         PacketHeader header;
-        header.packetNumber = packetNumber;
-        header.totalPackets = totalPackets;
-        header.dataSize = data.size();
+        header.packetNumber = static_cast<uint32_t>(packetNumber);
+        header.totalPackets = static_cast<uint32_t>(totalPacketsCount);
+        header.dataSize = static_cast<uint32_t>(data.size());
         header.crc32 = calculateCRC32(data.data(), data.size());
 
-        std::vector<char> packet(sizeof(PacketHeader) + data.size());
-        std::memcpy(packet.data(), &header, sizeof(PacketHeader));
-        std::memcpy(packet.data() + sizeof(PacketHeader), data.data(),
+        std::vector<char> packetBuffer(sizeof(PacketHeader) + data.size());
+        std::memcpy(packetBuffer.data(), &header, sizeof(PacketHeader));
+        std::memcpy(packetBuffer.data() + sizeof(PacketHeader), data.data(),
                     data.size());
 
-        sendto(sockfd, packet.data(), packet.size(), 0,
-               reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
+        sendto(sockfd, packetBuffer.data(), packetBuffer.size(), 0,
+               reinterpret_cast<const sockaddr*>(&serverAddr),
+               sizeof(serverAddr));
     }
 };
 

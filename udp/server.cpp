@@ -52,27 +52,28 @@ struct ClientState {
     std::vector<std::vector<char>> packets;
     std::string filename;
     uint32_t totalPackets = 0;
+    uint32_t receivedPacketCount = 0;
     size_t totalDataSize = 0;
     std::chrono::steady_clock::time_point startTime;
     int droppedPackets = 0;
     int crcErrors = 0;
     std::vector<std::string> errorBuffer;
-    // FIXME Не всегда получается удачным вариантом, но пока можно оставить
     int displayLine = -1;
 };
 
 class UDPServer {
    public:
-    UDPServer(int lossCount, const std::vector<uint32_t>& lossPackets)
-        : lossPackets(lossPackets) {
-        lossCounters.resize(lossPackets.size(), 1);
+    UDPServer(int lossCount, const std::vector<uint32_t>& lossPacketsArg)
+        : lossPackets(lossPacketsArg), currentDisplayLine(1) {
+        lossCounters.resize(lossPackets.size(), 0);
+        for (size_t i = 0; i < lossCounters.size(); ++i) lossCounters[i] = 1;
     }
     ~UDPServer() {
         stopProgress = true;
         if (progressThread.joinable()) {
             progressThread.join();
         }
-        close(sockfd);
+        if (sockfd != -1) close(sockfd);
     }
 
     void run() {
@@ -85,15 +86,17 @@ class UDPServer {
         serverAddr.sin_port = htons(0);
 
         if (bind(sockfd, reinterpret_cast<sockaddr*>(&serverAddr),
-                 sizeof(serverAddr)) < 0)
+                 sizeof(serverAddr)) < 0) {
+            close(sockfd);
             throw std::runtime_error("Bind failed");
+        }
 
         socklen_t addrLen = sizeof(serverAddr);
         getsockname(sockfd, reinterpret_cast<sockaddr*>(&serverAddr), &addrLen);
         std::cout << "Server started on port: " << ntohs(serverAddr.sin_port)
                   << std::endl;
 
-        startProgressThread();  // поток с прогресс баром
+        startProgressThread();
 
         while (true) {
             char buffer[65536];
@@ -107,45 +110,62 @@ class UDPServer {
 
             PacketHeader* header = reinterpret_cast<PacketHeader*>(buffer);
             char* data = buffer + sizeof(PacketHeader);
-            size_t dataSize = recvLen - sizeof(PacketHeader);
+
+            if (header->dataSize != (recvLen - sizeof(PacketHeader))) {
+                // std::cerr << "Data size mismatch" << std::endl;
+                continue;
+            }
 
             uint32_t receivedCRC = header->crc32;
             uint32_t calculatedCRC = calculateCRC32(data, header->dataSize);
-            if (receivedCRC != calculatedCRC) {
-                std::lock_guard<std::mutex> lock(clientsMutex);
-                auto& state = clients[{inet_ntoa(clientAddr.sin_addr),
-                                       ntohs(clientAddr.sin_port)}];
-                state.crcErrors++;
-                state.errorBuffer.push_back(
-                    RED + std::string("[ERROR] CRC mismatch in packet ") +
-                    std::to_string(header->packetNumber) + " | CRC errors: " +
-                    std::to_string(state.crcErrors) + RESET);
-                continue;
-            }
 
             std::string clientIP(inet_ntoa(clientAddr.sin_addr));
             uint16_t clientPort = ntohs(clientAddr.sin_port);
             ClientID clientID = {clientIP, clientPort};
 
-            std::lock_guard<std::mutex> lock(clientsMutex);
+            std::unique_lock<std::mutex> lock(clientsMutex);
             auto& state = clients[clientID];
 
-            if (state.packets.empty()) {
+            if (receivedCRC != calculatedCRC) {
+                if (!state.packets
+                         .empty()) {  // Только если уже начали получать
+                    state.crcErrors++;
+                    state.errorBuffer.push_back(
+                        RED + std::string("[ERROR] CRC mismatch in packet ") +
+                        std::to_string(header->packetNumber) +
+                        " | CRC errors: " + std::to_string(state.crcErrors) +
+                        RESET);
+                }
+                continue;
+            }
+
+            if (state.packets.empty() && header->totalPackets > 0) {
                 state.packets.resize(header->totalPackets);
                 state.totalPackets = header->totalPackets;
                 state.filename = "received_file";
                 state.startTime = std::chrono::steady_clock::now();
                 state.totalDataSize = 0;
+                state.receivedPacketCount = 0;
                 state.droppedPackets = 0;
                 state.crcErrors = 0;
                 state.errorBuffer.clear();
-                std::cerr << "\n"
-                          << GREEN << "Started receiving file from " << clientIP
-                          << ":" << clientPort << " (" << header->totalPackets
-                          << " packets)" << RESET << "\n";
+                state.displayLine = this->currentDisplayLine++;
+
+                setCursorPosition(state.displayLine);
+                std::cerr << "\033[K" << GREEN << "Client " << clientIP << ":"
+                          << clientPort << " | Receiving " << state.filename
+                          << " (" << header->totalPackets << " packets)"
+                          << RESET << std::flush;
             }
 
-            if (header->packetNumber >= state.totalPackets) continue;
+            if (header->packetNumber >= state.totalPackets ||
+                state.totalPackets == 0) {
+                // Пакет вне диапазона или клиент еще не инициализирован
+                sendACK(clientAddr,
+                        header->packetNumber);  // Отправить ACK на всякий
+                                                // случай, если это дубликат
+                continue;
+            }
 
             if (!state.packets[header->packetNumber].empty()) {
                 sendACK(clientAddr, header->packetNumber);
@@ -167,7 +187,7 @@ class UDPServer {
                 state.errorBuffer.push_back(
                     YELLOW + std::string("[DROPPED] Packet ") +
                     std::to_string(header->packetNumber) +
-                    " (as per loss rule) | Dropped total: " +
+                    " (rule) | Dropped: " +
                     std::to_string(state.droppedPackets) + RESET);
                 continue;
             }
@@ -175,53 +195,83 @@ class UDPServer {
             state.packets[header->packetNumber].assign(data,
                                                        data + header->dataSize);
             state.totalDataSize += header->dataSize;
+            state.receivedPacketCount++;
             sendACK(clientAddr, header->packetNumber);
 
-            bool complete = true;
-            for (const auto& pkt : state.packets) {
-                if (pkt.empty()) {
-                    complete = false;
-                    break;
-                }
-            }
-
-            if (complete) {
-                std::string clientPortS = std::to_string(clientPort);
-                fs::path outputFilename =
-                    fs::path(state.filename).filename().string() + "_from_" +
-                    clientIP + " " + clientPortS;
-                std::ofstream outFile(outputFilename, std::ios::binary);
+            if (state.receivedPacketCount == state.totalPackets) {
+                bool complete =
+                    true;  // Дополнительная проверка, хотя receivedPacketCount
+                           // должно быть достаточно
                 for (const auto& pkt : state.packets) {
-                    outFile.write(pkt.data(), pkt.size());
+                    if (pkt.empty()) {
+                        complete = false;
+                        break;
+                    }
                 }
 
-                // Ожидаем завершения отрисовки, чтобы не пересеклись строки
-                std::unique_lock<std::mutex> lock(clientsMutex);
-                auto now = std::chrono::steady_clock::now();
-                double totalTimeSec =
-                    std::chrono::duration<double>(now - state.startTime)
-                        .count();
-                double finalSpeedMBps =
-                    (state.totalDataSize / 1024.0 / 1024.0) / totalTimeSec;
+                if (complete) {
+                    fs::path baseFilename = fs::path(state.filename).filename();
+                    std::string finalFilenameStr = baseFilename.string() +
+                                                   "_from_" + clientIP + "_" +
+                                                   std::to_string(clientPort);
+                    if (baseFilename.has_extension()) {
+                        finalFilenameStr = baseFilename.stem().string() +
+                                           "_from_" + clientIP + "_" +
+                                           std::to_string(clientPort) +
+                                           baseFilename.extension().string();
+                    }
 
-                // очистка строки клиента и результат
-                int clientLine = state.displayLine;
-                setCursorPosition(clientLine);
-                std::cerr << "\033[K" << GREEN
-                          << "File received successfully from " << clientIP
-                          << ":" << clientPort << RESET << "\n";
+                    std::ofstream outFile(finalFilenameStr, std::ios::binary);
+                    if (outFile.is_open()) {
+                        for (const auto& pkt : state.packets) {
+                            outFile.write(pkt.data(), pkt.size());
+                        }
+                        outFile.close();
+                    } else {
+                        state.errorBuffer.push_back(
+                            RED + std::string("Failed to open output file: ") +
+                            finalFilenameStr + RESET);
+                    }
 
-                std::cerr << "\r\033[KTotal size: "
-                          << (state.totalDataSize / 1024) << " KB | "
-                          << "Time: " << totalTimeSec << " s | "
-                          << "Final speed: " << CYAN << finalSpeedMBps << RESET
-                          << " MB/s | " << YELLOW
-                          << "Dropped: " << state.droppedPackets << RESET
-                          << " | " << RED << "CRC errors: " << state.crcErrors
-                          << RESET << "\n";
+                    auto now = std::chrono::steady_clock::now();
+                    double totalTimeSec =
+                        std::chrono::duration<double>(now - state.startTime)
+                            .count();
+                    double finalSpeedMBps = 0;
+                    if (totalTimeSec > 0) {
+                        finalSpeedMBps =
+                            (state.totalDataSize / 1024.0 / 1024.0) /
+                            totalTimeSec;
+                    }
 
-                clients.erase(clientID);
+                    int clientLine = state.displayLine;
+                    setCursorPosition(clientLine);
+                    std::cerr << "\033[K" << GREEN << "File "
+                              << finalFilenameStr << " received from "
+                              << clientIP << ":" << clientPort << RESET << "\n";
+
+                    std::cerr << "Total size: " << (state.totalDataSize / 1024)
+                              << " KB | "
+                              << "Time: " << std::fixed << std::setprecision(2)
+                              << totalTimeSec << " s | "
+                              << "Speed: " << CYAN << std::fixed
+                              << std::setprecision(2) << finalSpeedMBps << RESET
+                              << " MB/s | " << YELLOW
+                              << "Dropped: " << state.droppedPackets << RESET
+                              << " | " << RED << "CRC: " << state.crcErrors
+                              << RESET << "\n";
+
+                    if (!state.errorBuffer.empty()) {
+                        std::cerr << "Log for " << clientIP << ":" << clientPort
+                                  << ":\n";
+                        for (const auto& errMsg : state.errorBuffer) {
+                            std::cerr << errMsg << "\n";
+                        }
+                    }
+                    clients.erase(clientID);
+                }
             }
+            // lock будет освобожден при выходе из области видимости
         }
     }
 
@@ -236,77 +286,74 @@ class UDPServer {
 
     std::vector<uint32_t> lossPackets;
     std::vector<int> lossCounters;
-    int currentDisplayLine = 0;
+    int currentDisplayLine;
 
     std::thread progressThread;
     std::atomic<bool> stopProgress{false};
 
     void setCursorPosition(int line) {
-        std::cerr << "\033[" << line + 1 << ";0H";
-    }
-
-    void updateClientProgress(ClientState& state, int progress,
-                              const std::string& bar, double avgSpeedMBps,
-                              size_t totalKB, int clientLine) {
-        setCursorPosition(clientLine);
-        std::cerr << "\033[K";
-        std::cerr << "[" << GREEN << bar << RESET << "] " << std::setw(3)
-                  << progress << "% | "
-                  << "Total: " << totalKB << " KB | "
-                  << "Avg speed: " << CYAN << avgSpeedMBps << RESET << " MB/s";
+        if (line >= 0) {
+            std::cerr << "\033[" << line + 1 << ";0H";
+        }
     }
 
     void sendACK(const sockaddr_in& clientAddr, uint32_t packetNumber) {
+        ACKPacket ack;
+        ack.packetNumber = packetNumber;
         sendto(sockfd, &packetNumber, sizeof(packetNumber), 0,
                reinterpret_cast<const sockaddr*>(&clientAddr),
                sizeof(clientAddr));
     }
 
     void startProgressThread() {
-        progressThread = std::thread([this]() {
+        progressThread = std::thread([this] {
             const int BAR_WIDTH = 40;
             while (!stopProgress) {
                 std::unique_lock<std::mutex> lock(clientsMutex);
-                int line = 0;
 
-                for (auto& [id, state] : clients) {
-                    size_t totalReceived = state.totalDataSize;
-                    uint32_t totalPackets = state.totalPackets;
-                    size_t fileSize = totalPackets * 1400;
+                for (auto it = clients.begin(); it != clients.end(); ++it) {
+                    ClientState& state = it->second;
+                    const ClientID& id = it->first;
 
-                    if (totalPackets == 0) continue;
+                    if (state.displayLine == -1 || state.totalPackets == 0)
+                        continue;
+
+                    // receivedPacketCount уже обновляется в основном потоке
+                    uint32_t pktsReceived = state.receivedPacketCount;
 
                     double durationSec =
                         std::chrono::duration<double>(
                             std::chrono::steady_clock::now() - state.startTime)
                             .count();
-                    double speedKBps =
-                        durationSec > 0 ? (totalReceived / 1024.0) / durationSec
-                                        : 0;
+                    double speedKBps = 0;
+                    if (durationSec > 0.01) {
+                        speedKBps =
+                            (state.totalDataSize / 1024.0) / durationSec;
+                    }
 
-                    int progress =
-                        totalPackets > 0
-                            ? static_cast<int>((state.totalDataSize /
-                                                static_cast<double>(fileSize)) *
-                                               100)
-                            : 0;
+                    int progressPercent = static_cast<int>(
+                        (static_cast<double>(pktsReceived) * 100.0) /
+                        state.totalPackets);
+                    progressPercent =
+                        std::min(100, std::max(0, progressPercent));
 
-                    int filledLength = BAR_WIDTH * progress / 100;
+                    int filledLength = BAR_WIDTH * progressPercent / 100;
                     std::string bar(filledLength, '#');
                     bar.resize(BAR_WIDTH, ' ');
 
-                    setCursorPosition(line);
-                    std::cerr << "\033[K[" << GREEN << bar << RESET << "] "
-                              << std::setw(3) << progress << "% | "
-                              << "Total: " << (totalReceived / 1024) << " KB | "
-                              << "Speed: " << CYAN << speedKBps << RESET
-                              << " KB/s";
-
-                    ++line;
+                    setCursorPosition(state.displayLine);
+                    std::cerr << "\033[K";
+                    std::cerr
+                        << "[" << GREEN << bar << RESET << "] " << std::setw(3)
+                        << progressPercent << "% | Pkts: " << pktsReceived
+                        << "/" << state.totalPackets
+                        << " | Total: " << std::setw(7)
+                        << (state.totalDataSize / 1024) << " KB | "
+                        << "Speed: " << CYAN << std::fixed
+                        << std::setprecision(2) << std::setw(7) << speedKBps
+                        << RESET << " KB/s" << std::flush;
                 }
-
                 lock.unlock();
-
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         });
