@@ -1,0 +1,141 @@
+services:
+    dhcp-server:
+        build:
+            context: .
+            dockerfile: server/Dockerfile
+        container_name: my_dhcp_server
+        privileged: true
+        restart: unless-stopped
+        depends_on:
+            - netshooter
+        networks:
+            dhcp_net:
+                aliases:
+                    - dhcpserver.local
+        cap_add:
+            - NET_ADMIN
+            - NET_BROADCAST
+
+    dhcp-client-test1:
+        build:
+            context: ./client
+            dockerfile: Dockerfile
+        container_name: test_client1
+        # restart: "no"
+        depends_on:
+            - dhcp-server
+        networks:
+            - dhcp_net
+        cap_add:
+            - NET_ADMIN
+    dhcp-client-test2:
+        build:
+            context: ./client
+            dockerfile: Dockerfile
+        container_name: test_client2
+        # restart: "no"
+        depends_on:
+            - dhcp-server
+        networks:
+            - dhcp_net
+        cap_add:
+            - NET_ADMIN
+
+    netshooter:
+        image: nicolaka/netshoot
+        container_name: netshoot_monitor
+        privileged: true
+        cap_add:
+            - NET_ADMIN
+            - NET_RAW
+        networks:
+            - dhcp_net
+        volumes:
+            - ./captures:/captures
+        command: >
+            sh -c "mkdir -p /captures && 
+                    echo 'Starting tcpdump' && 
+                    tcpdump -i eth0 -w /captures/dhcp_traffic.pcap '' & 
+                    PID_TCPDUMP=$$! && 
+                    echo 'tcpdump started with PID ' $$PID_TCPDUMP &&
+                    tail -f /dev/null"
+
+networks:
+    dhcp_net:
+        driver: bridge
+        ipam:
+            driver: default
+            config:
+                - subnet: "172.20.0.0/16"
+        # netshooter:
+        #     image: nicolaka/netshoot
+        #     container_name: netshoot_monitor
+        #     privileged: true
+        #     cap_add:
+        #         - NET_ADMIN
+        #         - NET_RAW 
+        #     networks:
+        #         - dhcp_net
+        #     command: >
+        #         sh -c "
+        #             echo '[NETSHOOT CLIENT] Preparing environment...';
+        #             mkdir -p /captures;
+
+        #             echo '[NETSHOOT CLIENT] Starting tcpdump on eth0 to capture DHCP, ICMP, and ARP traffic...';
+        #             tcpdump -i eth0 -U -w /captures/client_netshoot_full_session.pcap '' &
+        #             TCPDUMP_PID=$$!
+        #             echo \"[NETSHOOT CLIENT] tcpdump started with PID $$TCPDUMP_PID.\";
+
+        #             sleep 1;
+
+        #             echo '[NETSHOOT CLIENT] Starting DHCP client (udhcpc) for eth0...';
+        #             udhcpc -i eth0 -b -p /var/run/udhcpc.eth0.pid -S;
+
+        #             if [ -e /var/run/udhcpc.eth0.pid ]; then # Проверка, что используется фоновый режим
+        #             echo '[NETSHOOT CLIENT] Waiting for IP address to be assigned (udhcpc in background)...';
+        #             attempts=0;
+        #             while ! ip addr show eth0 | grep -q 'inet '; do
+        #                 attempts=$((attempts+1));
+        #                 if [ \"$$attempts\" -gt 30 ]; then
+        #                 echo '[NETSHOOT CLIENT] ERROR: Failed to get IP address in time!';
+        #                 ip addr show eth0;
+        #                 echo \"[NETSHOOT CLIENT] Stopping tcpdump (PID $$TCPDUMP_PID)...\"
+        #                 kill $$TCPDUMP_PID || echo \"Failed to kill tcpdump or already stopped.\"
+        #                 wait $$TCPDUMP_PID 2>/dev/null
+        #                 exit 1;
+        #                 fi;
+        #                 sleep 1;
+        #             done;
+        #             fi;
+
+        #             CLIENT_IP=$$(ip addr show eth0 | grep 'inet ' | awk '{print $$2}' | cut -d/ -f1 || echo \"IP_NOT_FOUND\");
+        #             if [ \"$$CLIENT_IP\" = \"IP_NOT_FOUND\" ]; then
+        #                 echo \"[NETSHOOT CLIENT] ERROR: Could not determine client IP after DHCP process.\"
+        #                 echo \"[NETSHOOT CLIENT] Current interface status:\"
+        #                 ip addr show eth0
+        #                 echo \"[NETSHOOT CLIENT] Stopping tcpdump (PID $$TCPDUMP_PID)...\"
+        #                 kill $$TCPDUMP_PID || echo \"Failed to kill tcpdump or already stopped.\"
+        #                 wait $$TCPDUMP_PID 2>/dev/null
+        #                 exit 1;
+        #             fi
+
+        #             ROUTER_IP=$$(ip route | grep default | awk '{print $$3}' || echo 'not_found');
+
+        #             echo \"[NETSHOOT CLIENT] Successfully obtained IP: $$CLIENT_IP\";
+        #             echo \"[NETSHOOT CLIENT] Gateway: $$ROUTER_IP\";
+
+        #             echo '[NETSHOOT CLIENT] Performing network tests...';
+        #             if [ \"$$ROUTER_IP\" != 'not_found' ]; then
+        #             echo \"[NETSHOOT CLIENT] Pinging gateway $$ROUTER_IP...\";
+        #             ping -c 3 $$ROUTER_IP;
+        #             else
+        #             echo \"[NETSHOOT CLIENT] Gateway not found, skipping gateway ping.\";
+        #             fi;
+        #             echo \"[NETSHOOT CLIENT] Pinging google.com...\";
+        #             ping -c 3 google.com;
+
+
+        #             tail -f /dev/null;
+        #         "
+        #     volumes:
+        #         - ./captures:/captures
